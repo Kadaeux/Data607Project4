@@ -2,27 +2,186 @@
 title: "Project 4 - Document Classification"
 author: "Nicholas Kunze"
 date: "2024-04-13"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+library(stringr)
+library(tidyverse)
+library(tm)
+library(e1071)
+library(caret)
 ```
 
 ## Overview
 
-In this project I will be using the [Naive](https://learning.oreilly.com/library/view/doing-data-science/9781449363871/ch04.html#idm46107867092920) [Bayes](https://www.ibm.com/topics/naive-bayes) classifier machine learning algorithm to make predictions on whether an email is spam or not. IBM, the company I work at, has a lot of education around ML algorithms and I leveraged that here in the project. I've also previously worked with a team on something similar (not Naive Bayes) using a TensorFlow model to predict credit card fraud, the public version of which is hosted [here](https://github.com/IBM/ai-on-z-fraud-detection).
+In this project I will be using the [[Naive]](https://learning.oreilly.com/library/view/doing-data-science/9781449363871/ch04.html#idm46107867092920) [[Bayes]](https://www.ibm.com/topics/naive-bayes) [[classifier]](https://www.linkedin.com/pulse/detailed-naive-bayes-spam-filter-r-leonardo-anello/) machine learning algorithm to make predictions on whether an email is spam or not. IBM, the company I work at, has a lot of education around ML algorithms and I leveraged that here in the project as well as other sources. I've also previously worked with a team on something similar (statistical classification) using a TensorFlow model to predict credit card fraud, the public version of which is hosted [[here]](https://github.com/IBM/ai-on-z-fraud-detection).
 
-First, we'll need to ingest our data and prepare it; preparing it will involve creating the 'metadata' around each email by creating our corpora. The important part here is that the data we are using is already marked as fraudulent, spam, or not, ham. We then split this data into two groups, one for our model training and the other to test how accurate our trained model is. I usually split these into groups of sized 90/10 or 95/5.
+First, we'll need to ingest our data and prepare it; preparing it will involve creating the 'metadata' around each email by creating our corpus of terms used in the email, and create our email term frequency matrix. The important part here is that the data we are using is already marked as fraudulent, spam, or not, ham. We then split this data into two groups, one for our model training and the other to test how accurate our trained model is. I usually split these into groups of sized 90/10 or 95/5.
 
-As stated, after this we train our model
+## Loading Email Data
 
-## Including Plots
+I'm going to directly pull the tar files containing our ham and spam emails, parse the contents into data frames, then break them up into our training and testing data.
 
-You can also embed plots, for example:
+```{r}
+tmpdir <- tempdir()
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+base_url <- "https://spamassassin.apache.org/old/publiccorpus/"
+spam_url <- paste0(base_url,"20021010_spam.tar.bz2")
+ham_url <- paste0(base_url,"20021010_easy_ham.tar.bz2")
+
+spamTar <- basename(spam_url)
+hamTar <- basename(ham_url)
+
+if(!file.exists("20021010_spam.tar.bz2"))
+  download.file(spam_url, spamTar)
+if(!file.exists("20021010_easy_ham.tar.bz2"))
+  download.file(ham_url, hamTar)
+
+untar(spamTar, exdir = tmpdir)
+untar(hamTar, exdir = tmpdir)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+getFileText = function(uri, output){
+  text <-readLines(uri)
+  # return email text 
+  return(paste(text, collapse="\n"))
+}
+
+getFrom = function(email, output){
+  return(str_extract(email,"(?<=From: ).*?(?=\\n)"))
+}
+
+getTo = function(email, output){
+  return(str_extract(email,"(?<=To: ).*?(?=\\s)"))
+}
+
+getCType = function(email, output){
+  return(str_extract(email,"(?<=Content-Type: ).*?(?=\\s)"))
+}
+  
+# Need to convert body text to UTF-8
+getBody = function(email, output){
+  return(substr(email,str_locate(email,"\\n\\n")[,2],nchar(iconv(email, from = "", to = "UTF8"))))
+}
+```
+
+```{r}
+hamFiles <- list.files(path = paste0(tmpdir,"/easy_ham/"), full.names = TRUE)
+hamText <- apply(array(hamFiles), 1, getFileText)
+spamFiles <- list.files(path = paste0(tmpdir,"/spam/"), full.names = TRUE)
+spamText <- apply(array(spamFiles), 1, getFileText)
+```
+
+```{r}
+from <- apply(array(hamText), 1, getFrom)
+to <- apply(array(hamText), 1, getTo)
+cType <- apply(array(hamText), 1, getCType)
+body <- apply(array(hamText), 1, getBody)
+
+ham <- data.frame(from,
+                  to,
+                  cType,
+                  body) 
+
+from <- apply(array(spamText), 1, getFrom)
+to <- apply(array(spamText), 1, getTo)
+cType <- apply(array(spamText), 1, getCType)
+body <- apply(array(spamText), 1, getBody)
+
+spam <- data.frame(from,
+                  to,
+                  cType,
+                  body) 
+
+
+unshuffled <- rbind(ham %>% mutate(type = "ham"),
+  spam %>% mutate(type = "spam"))
+
+# Shuffle emails to allow us to pull random ham vs spam during test/train separation 
+emails <- unshuffled[sample(nrow(unshuffled), nrow(unshuffled)),]
+
+head(emails)
+```
+
+## Model Input Prep
+
+Now that we have our emails loaded and tagged as ham or spam, we can build our corpus and use it to build our term frequency matrix (document term matrix). Using this frequency matrix, we can 'train' our Naive Bayes model to predict the ham or spam classification based on specific words that are or are not used. We're able to do this as we already know which emails are ham or spam based on the tag. We can then test our model using our remaining 10% of emails that we did not pass in to our model for training.
+
+```{r}
+corpus <- VCorpus(x = VectorSource(emails$body))
+
+# Clean corpuses
+corpus <- tm_map(x = corpus, FUN = removeNumbers)
+corpus <- tm_map(x = corpus, content_transformer(tolower))
+corpus <- tm_map(x = corpus, FUN = removePunctuation)
+corpus <- tm_map(x = corpus, FUN = removeWords, stopwords())
+corpus <- tm_map(x = corpus, FUN = stripWhitespace)
+corpus <- tm_map(x = corpus, FUN = stemDocument)
+```
+
+```{r}
+# Create our word frequency per doc matrix
+docTermMatrix <- DocumentTermMatrix(x = corpus)
+```
+
+```{r}
+# Split matrix by getting first 90% of matrix for train and last 10% for test
+trainData <- docTermMatrix[1:round(nrow(docTermMatrix)*0.9, 0), ]
+testData <- docTermMatrix[(round(nrow(docTermMatrix)*0.9, 0)+1):nrow(docTermMatrix), ]
+
+trainLabels <- emails[1:round(nrow(emails)*0.9, 0), ]$type
+testLabels <- emails[(round(nrow(emails)*0.9, 0)+1):nrow(docTermMatrix), ]$type
+
+# Test proportions of 
+prop.table(table(trainLabels))
+prop.table(table(testLabels))
+```
+
+Our ratios are fairly consistent. Good to go.
+
+```{r}
+emailFreqWords <- findFreqTerms(docTermMatrix, 10)
+str(emailFreqWords)
+```
+
+```{r}
+trainDataFreq <- trainData[, emailFreqWords]
+testDataFreq <- testData[, emailFreqWords]
+```
+
+Now that we have our training and test term matrices, we convert the frequency to a factor of simply whether the doc contains the term or not.
+
+```{r}
+convert_counts <- function(x) {
+  x <- ifelse(x > 0, "Yes", "No")
+}
+```
+
+```{r}
+trainDataFreq <- apply(trainDataFreq, 2, convert_counts)
+testDataFreq <- apply(testDataFreq, 2, convert_counts)
+```
+
+## Train Model and Test Accuracy
+
+Here we train our model using our training data matrix then test it for accuracy using our test data matrix.
+
+```{r}
+classifier = naiveBayes(trainDataFreq, trainLabels)
+sample(classifier$tables,5)
+```
+
+```{r}
+testPredictions <- predict(classifier, testDataFreq)
+confusionMatrix(data = testPredictions, 
+ reference = factor(testLabels),
+ positive = "spam",
+ dnn = c("Predicted", "Observed"))
+```
+
+Our model has an estimated 96.4% accuracy rating in its ability to determine if an email is ham or spam based on term usage.
